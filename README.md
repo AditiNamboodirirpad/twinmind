@@ -1,14 +1,49 @@
-# TwinMind
+# TwinMind — Live Meeting Assistant
 
-## What it does
-
-TwinMind is a live meeting assistant. It listens to your microphone, transcribes speech in real time, generates AI suggestions about what's being said, and lets you chat with an AI that has read the full transcript.
+> Listens to your mic, transcribes speech in real time, surfaces 3 AI suggestions every 30 seconds, and lets you chat with an AI that has read the full transcript.
 
 ---
 
-## Architecture — 3 hooks, 3 columns
+## Links
 
-The app is split into three independent concerns, each with its own hook and its own UI column:
+| | |
+|---|---|
+| **Live app** | https://twinmind-delta.vercel.app |
+| **GitHub** | https://github.com/AditiNamboodirirpad/twinmind |
+
+---
+
+## Setup
+
+**Requirements:** Node 18+, a [Groq API key](https://console.groq.com)
+
+```bash
+git clone https://github.com/AditiNamboodirirpad/twinmind.git
+cd twinmind
+npm install
+npm run dev
+```
+
+Open `http://localhost:5173`, click **Settings**, paste your Groq API key, and click the mic button.
+
+---
+
+## Stack
+
+| Layer | Choice |
+|---|---|
+| Framework | React 19 + Vite |
+| Styling | Tailwind CSS v4 |
+| Speech-to-text | Groq Whisper Large V3 |
+| LLM | Groq Llama 4 Maverick (`meta-llama/llama-4-maverick-17b-128e-instruct`), falls back to `llama-3.3-70b-versatile` on 404 |
+| Hosting | Vercel |
+| Backend | None — fully client-side |
+
+---
+
+## Architecture
+
+Three independent hooks, one per column. `App.jsx` owns settings state and wires them together.
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -23,75 +58,85 @@ The app is split into three independent concerns, each with its own hook and its
 └─────────────────┴───────────────────┴───────────────┘
 ```
 
-The hooks share one piece of state: `fullTranscriptRef` — a string of everything spoken so far. `useRecorder` owns and writes it; `useSuggestions` and `useChat` read from it.
+The hooks share one piece of state: `fullTranscriptRef` — a running string of everything spoken. `useRecorder` owns and writes it; the other two hooks read from it.
 
----
-
-## Dataflow — step by step
+### Dataflow
 
 ```
 USER SPEAKS
     │
     ▼
-MediaRecorder (browser API)
+MediaRecorder (browser)
   captures audio continuously
   cuts a chunk every 30s (configurable)
     │
     ▼
 Audio Blob
     │
-    ├──► Groq Whisper API  ──► transcript text
-    │         (speech-to-text)        │
-    │                                 ▼
-    │                         fullTranscriptRef  ◄── grows over time
-    │                         transcript[]       ◄── displayed in col 1
+    ├──► Groq Whisper Large V3 ──► transcript text
+    │         (speech-to-text)           │
+    │                                    ▼
+    │                            fullTranscriptRef  ◄── grows over time
+    │                            transcript[]       ◄── displayed in col 1
     │
     └──► (after each chunk) fetchSuggestions()
                 │
                 ▼
-        Groq LLaMA 70B
-        (reads last ~3000 chars of transcript)
+        Groq Llama 4 Maverick
+        (last ~3000 chars of transcript)
                 │
                 ▼
         3 suggestion cards  ──► displayed in col 2
-        (ANSWER / QUESTION / FACT CHECK / TALKING POINT)
+        (ANSWER / QUESTION TO ASK / FACT CHECK / TALKING POINT)
                 │
-                ▼ (user clicks a card, or types manually)
+                ▼ (card click → detailedAnswerPrompt + 8000 chars context)
+                  (typed question → chatPrompt + 6000 chars context)
         sendChatMessage()
                 │
                 ▼
-        Groq LLaMA 70B
-        (reads last ~6000 chars of transcript as context)
+        Groq Llama 4 Maverick — streamed token by token
                 │
                 ▼
-        AI reply  ──► displayed in col 3 (chat)
+        AI reply builds word by word ──► col 3 (chat)
 ```
 
 ---
 
-## Key design decisions
+## Prompt strategy
 
-**Chunked recording, not streaming** — The browser's `MediaRecorder` records audio into a rolling buffer. Every N seconds, the current recorder stops (triggering the Whisper API call), and a new one starts immediately — zero gap. This avoids the complexity of streaming audio while keeping transcription roughly real-time.
+Three prompts, each with a different job and a different context window:
 
-**Ref bridge for cross-hook calls** — `useSuggestions` needs to be called from inside `useRecorder`, but React hooks can't import each other. The fix: `App.jsx` creates `onTranscribedRef` and assigns `fetchSuggestions` to it after both hooks run. `useRecorder` calls `onTranscribedRef.current()` — always gets the latest function, no stale closures.
+**Suggestions prompt** (`suggestionsContextWindow`, default 3000 chars)
+Runs every 30 seconds. Reads the last slice of transcript and returns exactly 3 typed cards as JSON. The type is chosen based on what just happened — a question asked gets an ANSWER, a dubious claim gets a FACT CHECK. Each preview is 15–20 words and delivers standalone value without clicking.
 
-**Two separate LLM calls** — Suggestions use a structured JSON prompt (returns typed cards). Chat uses a conversational prompt with the full transcript injected as context. Same model, different system prompts.
+**Chat prompt** (`chatContextWindow`, default 6000 chars)
+Handles free-form questions typed by the user. Larger context window than suggestions because the user is asking a specific question and needs accuracy, not speed.
 
-**Everything is client-side** — No backend. The Groq API key lives in the browser. Audio is never stored — it's sent directly to Groq's Whisper endpoint and discarded.
+**Detailed answer prompt** (`detailedAnswerContextWindow`, default 8000 chars)
+Used when a suggestion card is clicked. Separate from the chat prompt — it's instructed to go deep: lead with a direct answer, include numbers and names from the transcript, add 2–3 concrete next steps, and flag any claims worth checking. Larger context window because the card click implies the user wants the full picture.
+
+### Tradeoffs
+
+- **3000 chars for suggestions** — enough recent context to catch what just happened without noise from the start of the meeting. At ~5 words per second of speech, 3000 chars is roughly the last 3–4 minutes.
+- **Chunked audio, not streaming** — `MediaRecorder` cuts a blob every N seconds, sends it to Whisper, restarts immediately with zero gap. Streaming audio is simpler to implement than it sounds but adds latency complexity; chunking is predictable.
+- **Separate prompts for chat vs. card clicks** — a typed question needs a concise answer; a card click signals the user wants depth. Using the same prompt for both produces either too-short or too-long responses.
+- **Ref bridge for cross-hook calls** — `useRecorder` needs to call `fetchSuggestions` after each transcription, but hooks can't import each other. `App.jsx` creates `onTranscribedRef` and assigns `fetchSuggestions` to it; `useRecorder` calls `onTranscribedRef.current()`, always gets the latest function with no stale closure.
+- **Streaming chat responses** — chat replies stream token by token via Groq's SSE API. The message appears word by word instead of all at once, which feels faster and more responsive during a live meeting.
+- **Whisper garbage filter** — Whisper hallucinates on near-silent chunks (returns "you", "um", "Thanks for watching."). A chunk is discarded only if it fails *both* a character count (< 20) *and* a word count (< 3) check, so real short sentences like "Yes, exactly." still make it through.
 
 ---
 
-## External dependencies
+## Settings
 
-| Service | What for | Model |
+All configurable at runtime via the Settings panel — no code changes needed:
+
+| Setting | Default | What it controls |
 |---|---|---|
-| Groq Whisper | Speech → text | `whisper-large-v3` |
-| Groq Chat | Suggestions + chat | `llama-3.3-70b-versatile` |
-
-Both go through the same Groq API key the user enters in Settings.
-
----
-
-## One-sentence summary
-
-> "It records your mic in 30-second chunks, sends each chunk to Whisper for transcription, then feeds the growing transcript to an LLM that surfaces suggestions in real time — and you can chat with that same LLM about anything being discussed."
+| Groq API Key | — | Required for all API calls |
+| Suggestions prompt | see `prompts.js` | System prompt for suggestion cards |
+| Chat prompt | see `prompts.js` | System prompt for typed questions |
+| Detailed answer prompt | see `prompts.js` | System prompt for card-click answers |
+| Suggestions context | 3000 chars | Transcript window for suggestions |
+| Chat context | 6000 chars | Transcript window for chat |
+| Detailed answer context | 8000 chars | Transcript window for card answers |
+| Auto-refresh interval | 30s | How often to cut a chunk and fetch suggestions |
